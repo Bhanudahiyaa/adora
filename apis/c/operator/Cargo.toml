@@ -1,0 +1,19 @@
+[package]
+name = "adora-operator-api-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "C API implementation for Adora Operator"
+documentation.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+adora-operator-api-types = { workspace = true }
+
+[build-dependencies]
+adora-operator-api-types = { workspace = true }
