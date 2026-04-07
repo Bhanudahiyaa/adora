@@ -42,6 +42,8 @@ use std::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 
+const FALLBACK_REPLAY_BACKOFF: Duration = Duration::from_secs(5);
+
 pub(crate) mod artifacts;
 mod control;
 mod events;
@@ -2072,51 +2074,16 @@ async fn start_inner(
                                 "state catch-up: log pruned for dataflow {uuid}, \
                                  falling back to full param replay for daemon {daemon_id}"
                             );
-                            let node_ids: Vec<_> = df
-                                .node_to_daemon
-                                .iter()
-                                .filter(|(_, did)| **did == daemon_id)
-                                .map(|(nid, _)| nid.clone())
-                                .collect();
-                            let replay_summary =
-                                if let Some(conn) = daemon_connections.get_mut(&daemon_id) {
-                                    replay_persisted_params_for_daemon(
-                                        *uuid,
-                                        daemon_id.clone(),
-                                        node_ids,
-                                        store.clone(),
-                                        conn.clone(),
-                                        clock.clone(),
-                                    )
-                                    .await
-                                } else {
-                                    tracing::warn!(
-                                        "failed to run fallback replay for dataflow {uuid}: \
-                                     daemon {daemon_id} is not connected"
-                                    );
-                                    ParamReplaySummary {
-                                        attempted: 0,
-                                        failed: 1,
-                                    }
-                                };
-                            if replay_summary.all_succeeded() {
-                                // Mark daemon as caught up only when full replay succeeds:
-                                // replay is authoritative for pruned history, and advancing
-                                // ack on partial failure can silently diverge runtime/store state.
-                                // Individual SetParam events don't trigger StateCatchUpAck, so
-                                // we set ack here for successful full replay to avoid repeated
-                                // fallback replays on every status-report cycle.
-                                df.daemon_ack_sequence
-                                    .insert(daemon_id.clone(), df.state_log_sequence);
-                            } else {
-                                tracing::warn!(
-                                    "fallback replay incomplete for dataflow {uuid} on daemon \
-                                     {daemon_id}: attempted={}, failed={}; leaving ack at {}",
-                                    replay_summary.attempted,
-                                    replay_summary.failed,
-                                    last_ack
-                                );
-                            }
+                            handle_pruned_state_catchup_fallback(
+                                *uuid,
+                                df,
+                                &daemon_id,
+                                store.clone(),
+                                &mut daemon_connections,
+                                clock.clone(),
+                                now,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -2164,15 +2131,80 @@ struct ParamReplayItem {
     value_json: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 struct ParamReplaySummary {
     attempted: usize,
     failed: usize,
 }
 
-impl ParamReplaySummary {
-    fn all_succeeded(self) -> bool {
-        self.failed == 0
+async fn handle_pruned_state_catchup_fallback(
+    dataflow_id: DataflowId,
+    dataflow: &mut RunningDataflow,
+    daemon_id: &DaemonId,
+    store: Arc<dyn adora_coordinator_store::CoordinatorStore>,
+    daemon_connections: &mut DaemonConnections,
+    clock: Arc<HLC>,
+    now: Instant,
+) {
+    if let Some(last_replay_attempt) = dataflow.last_replay_attempt.get(daemon_id) {
+        if now.duration_since(*last_replay_attempt) < FALLBACK_REPLAY_BACKOFF {
+            tracing::debug!(
+                "skipping fallback replay for dataflow {dataflow_id} on daemon {daemon_id}: \
+                 backoff active"
+            );
+            return;
+        }
+    }
+
+    let Some(connection) = daemon_connections.get_mut(daemon_id).cloned() else {
+        tracing::warn!(
+            "failed to run fallback replay for dataflow {dataflow_id}: \
+             daemon {daemon_id} is not connected"
+        );
+        return;
+    };
+
+    let node_ids_on_daemon: Vec<_> = dataflow
+        .node_to_daemon
+        .iter()
+        .filter(|(_, did)| *did == daemon_id)
+        .map(|(node_id, _)| node_id.clone())
+        .collect();
+    dataflow.last_replay_attempt.insert(daemon_id.clone(), now);
+
+    let replay_summary = replay_persisted_params_for_daemon(
+        dataflow_id,
+        daemon_id.clone(),
+        node_ids_on_daemon,
+        store,
+        connection,
+        clock,
+    )
+    .await;
+
+    let last_ack = dataflow
+        .daemon_ack_sequence
+        .get(daemon_id)
+        .copied()
+        .unwrap_or(0);
+    if replay_summary.failed == 0 {
+        // Mark daemon as caught up only when full replay succeeds:
+        // replay is authoritative for pruned history, and advancing
+        // ack on partial failure can silently diverge runtime/store state.
+        // Individual SetParam events don't trigger StateCatchUpAck, so
+        // we set ack here for successful full replay to avoid repeated
+        // fallback replays on every status-report cycle.
+        dataflow
+            .daemon_ack_sequence
+            .insert(daemon_id.clone(), dataflow.state_log_sequence);
+    } else {
+        tracing::warn!(
+            "fallback replay incomplete for dataflow {dataflow_id} on daemon \
+             {daemon_id}: attempted={}, failed={}; leaving ack at {}",
+            replay_summary.attempted,
+            replay_summary.failed,
+            last_ack
+        );
     }
 }
 
@@ -2416,6 +2448,7 @@ mod tests {
             created_at: 0,
             store_generation: 0,
             last_recovery_attempt: BTreeMap::new(),
+            last_replay_attempt: BTreeMap::new(),
             uv: false,
             state_log_sequence: 0,
             state_log: Vec::new(),
@@ -2588,7 +2621,6 @@ mod tests {
         .await;
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.failed, 0);
-        assert!(summary.all_succeeded());
 
         daemon_task.await.unwrap();
     }
@@ -2615,7 +2647,6 @@ mod tests {
         .await;
         assert_eq!(summary.attempted, 0);
         assert_eq!(summary.failed, 0);
-        assert!(summary.all_succeeded());
 
         let recv = timeout(TokioDuration::from_millis(50), rx.recv()).await;
         assert!(
@@ -2678,8 +2709,70 @@ mod tests {
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.failed, 1);
-        assert!(!summary.all_succeeded());
+        assert!(summary.failed > 0);
         daemon_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_replay_keeps_ack_unchanged_when_daemon_is_disconnected() {
+        let store: Arc<dyn CoordinatorStore> = Arc::new(InMemoryStore::new());
+        let dataflow_id = DataflowId::from(Uuid::new_v4());
+        let daemon_id = DaemonId::new(Some("m1".to_string()));
+        let node_id: adora_core::config::NodeId = "camera".to_string().into();
+
+        let value_bytes = serde_json::to_vec(&serde_json::json!(1)).unwrap();
+        store
+            .put_node_param(&dataflow_id, &node_id, "threshold", &value_bytes)
+            .unwrap();
+
+        let mut dataflow = test_running_dataflow(dataflow_id, daemon_id.clone(), node_id);
+        dataflow.state_log_sequence = 10;
+        dataflow.daemon_ack_sequence.insert(daemon_id.clone(), 3);
+
+        let mut daemon_connections = DaemonConnections::default();
+        handle_pruned_state_catchup_fallback(
+            dataflow_id,
+            &mut dataflow,
+            &daemon_id,
+            store,
+            &mut daemon_connections,
+            Arc::new(HLC::default()),
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(dataflow.daemon_ack_sequence.get(&daemon_id), Some(&3));
+        assert!(!dataflow.last_replay_attempt.contains_key(&daemon_id));
+    }
+
+    #[tokio::test]
+    async fn fallback_replay_respects_backoff_window() {
+        let store: Arc<dyn CoordinatorStore> = Arc::new(InMemoryStore::new());
+        let dataflow_id = DataflowId::from(Uuid::new_v4());
+        let daemon_id = DaemonId::new(Some("m1".to_string()));
+        let node_id: adora_core::config::NodeId = "camera".to_string().into();
+
+        let mut dataflow = test_running_dataflow(dataflow_id, daemon_id.clone(), node_id);
+        dataflow.state_log_sequence = 8;
+        dataflow.daemon_ack_sequence.insert(daemon_id.clone(), 2);
+        dataflow
+            .last_replay_attempt
+            .insert(daemon_id.clone(), Instant::now());
+
+        let mut daemon_connections = DaemonConnections::default();
+        handle_pruned_state_catchup_fallback(
+            dataflow_id,
+            &mut dataflow,
+            &daemon_id,
+            store,
+            &mut daemon_connections,
+            Arc::new(HLC::default()),
+            Instant::now(),
+        )
+        .await;
+
+        // No replay attempted while backoff is active, so ack remains unchanged.
+        assert_eq!(dataflow.daemon_ack_sequence.get(&daemon_id), Some(&2));
     }
 
     #[tokio::test]
