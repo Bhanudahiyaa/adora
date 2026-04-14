@@ -1849,6 +1849,8 @@ impl Daemon {
                                     &self.clock,
                                 ) {
                                     Ok(true) => dataflow.inc_pending(node_id),
+                                    // Catch-up is recovery/best-effort: keep applying remaining
+                                    // entries and let future catch-up cycles reconcile again.
                                     Ok(false) => {} // dropped (channel full)
                                     Err(_) => {
                                         tracing::warn!("catch-up: node `{node_id}` channel closed")
@@ -1866,6 +1868,8 @@ impl Daemon {
                                     &self.clock,
                                 ) {
                                     Ok(true) => dataflow.inc_pending(node_id),
+                                    // Catch-up is recovery/best-effort: keep applying remaining
+                                    // entries and let future catch-up cycles reconcile again.
                                     Ok(false) => {}
                                     Err(_) => {
                                         tracing::warn!("catch-up: node `{node_id}` channel closed")
